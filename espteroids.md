@@ -14,7 +14,33 @@ O código fonte foi dividido em alguns arquivos importantes, abaixo você encont
 Esse arquivo é um dos mais trabalhosos de se entender, encontrar e alterar.
 Ele também é um arquivo do tipo [header](https://pt.wikipedia.org/wiki/Arquivo_de_cabe%C3%A7alho) (.h), mas ele é usado como uma dependência direta da biblioteca utilizada [(TFT_eSPI)](https://github.com/Bodmer/TFT_espi). O arquivo **User_Setup.h** contém diversas configurações específicas do display e da comunicação entre display e microcontrolador (ESP32).
 Resumidamente, a biblioteca muda a forma em que certos métodos são utilizados na hora da compilação, e os adapta para o modelo especificado de display e comunicação. Foi necessário alterar o arquivo manualmente para que o display funcionasse corretamente.
-
+## Dispostivos externos
+### Potenciômetro
+O potenciômetro é ligado na porta 32 do ESP32 e também é alimentado pelo ESP32 nas portas 3,3V e GND.
+É usado um método conhecido como "mapping" no arduino "map()" para  gerar um ângulo equivalente da posição do potenciômetro como uma posição dentro do jogo usando uma função trigonométrica baseada em radianos.
+O código converte os valores em posição angular usando a função:
+```cpp
+void calcularDirecaoTiro() {
+  float rad = (nave.angulo + 90) * PI / 180.0;
+  float vel = 5.0;
+  nave.velTiroX = cos(rad) * vel;
+  nave.velTiroY = sin(rad) * vel;
+}
+```
+### Display TFT - ST7789
+Conexões:
+Display - ESP32
+Porta VCC - 3,3V
+GND - GND
+SCL - 18
+SDA - 23
+RST - 4
+DC - 2
+CS - 15
+A configuração do display é muito complexa para explicar em um documento tão generalista.
+Várias funções estão envolvidas no controle do display e até em sua configuração.
+Boa parte das declarações do display estão no arquivo **User_Setup.h**, incluindo a frequência de comunicação.
+Várias outras declarações e funções envolvidas na atualização e comunicação do display com o ESP32 e a lógica do jogo estão no arquivo **EspTeroids.ino**. Os sprites usados na função generalista **"desenharTudo"** estão no arquivo header **sprites_data.h**.
 ## O código em si
 ### EspTeroids.ino
 ```cpp
