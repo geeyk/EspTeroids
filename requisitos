@@ -1,0 +1,6 @@
+# Requisitos para a entrega de EspTeroids
+  - Código fonte
+  - Lista de dispositivos de entrada e saída
+    - Justificativa de escolha dos dispositivos
+  - Explicação das conexões dos dispositivos de entrada e saída ao Arduino (ESP32)
+    - Como os dispositivos externos são manipulados através dos códigos
