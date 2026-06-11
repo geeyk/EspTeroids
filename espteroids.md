@@ -1,0 +1,509 @@
+# EspTeroids
+Jogo em desenvolvimento por [**Option6**]()
+**Aviso!**
+O código fonte real se encontra no final do arquivo
+## Código fonte
+O código fonte foi dividido em alguns arquivos importantes, abaixo você encontra os mais importantes:
+## EspTeroids.ino (arquivo principal)
+[EspTeroids.ino](https://github.com/geeyk/EspTeroids/edit/main/README.md#espteroidsino) é o arquivo que contém boa parte das informações do projeto, assim como a lógica geral em C/C++. Esse é o código principal, mas ele precisa de acesso à informações que estão em outros arquivos listados a a seguir. Ele é o código que deve ser compilado e enviado ao microcontrolador, mas ele **não** funciona sem suas dependências.
+
+### sprites_data.h (arquivo dos sprites/imagens renderizadas)
+[sprites_data.h]() é o arquivo que contém toda a arte e vizuais do jogo de forma convertida. A biblioteca utilizada não lê os arquivos da mesma forma que um computador lê arquivos como .png e .jpg - os arquivos precisaram ser convertidos em um arquivo do tipo [header](https://pt.wikipedia.org/wiki/Arquivo_de_cabe%C3%A7alho) (.h) para que funcionasse adequadamente, mas tivemos dificuldades que não puderam ser superadas para convertê-los adequadamente.
+### User_Setup.h
+.../Arduino/libraries/TFT_eSPI/User_Setup.h
+Esse arquivo é um dos mais trabalhosos de se entender, encontrar e alterar.
+Ele também é um arquivo do tipo [header](https://pt.wikipedia.org/wiki/Arquivo_de_cabe%C3%A7alho) (.h), mas ele é usado como uma dependência direta da biblioteca utilizada [(TFT_eSPI)](https://github.com/Bodmer/TFT_espi). O arquivo **User_Setup.h** contém diversas configurações específicas do display e da comunicação entre display e microcontrolador (ESP32).
+Resumidamente, a biblioteca muda a forma em que certos métodos são utilizados na hora da compilação, e os adapta para o modelo especificado de display e comunicação. Foi necessário alterar o arquivo manualmente para que o display funcionasse corretamente.
+
+## O código em si
+### EspTeroids.ino
+```cpp
+/*
+ * Jogo: Asteroids com Double Buffer (16 bpp)
+ * Hardware: ESP32 + TFT (TFT_eSPI) + potenciômetro pino 32
+ * 
+ * Controle: potenciômetro define ângulo de tiro (auto-tiro a cada 300ms)
+ * Sem pisca-pisca, sem carregamento progressivo (não funcionou como esperado.
+ * SPI reduzida para 20 MHz.
+ */
+
+#include <TFT_eSPI.h>
+#include <SPI.h>
+
+// ========== CONSTANTES ==========
+const int SCREEN_W = 240;
+const int SCREEN_H = 320;
+
+const int FRAME_TIME_MS = 20;      // 50 FPS
+const int TIRO_COOLDOWN_MS = 300;
+const int MAX_ASTEROIDES = 8;
+const int MAX_TIROS = 15;
+
+const int NAVE_SIZE = 16;
+const int ASTEROIDE_SIZE = 14;
+const int TIRO_SIZE = 4;
+
+const int PIN_POT = 32;
+
+const int BASE_SPAWN_INTERVAL_MS = 3000;
+const int MIN_SPAWN_INTERVAL_MS = 800;
+
+// ========== ESTRUTURAS ==========
+struct Nave {
+  int x, y;
+  int angulo;
+  float velTiroX, velTiroY;
+};
+
+struct Asteroide {
+  int x, y;
+  float velX, velY;
+  bool ativo;
+  int tipo;   // não usado, mantido para compatibilidade
+};
+
+struct Tiro {
+  float x, y;
+  float velX, velY;
+  bool ativo;
+};
+
+// ========== OBJETOS GLOBAIS ==========
+TFT_eSPI tft = TFT_eSPI();
+
+// Sprite de tela inteira (16 bpp)
+TFT_eSprite telaBuffer = TFT_eSprite(&tft);
+
+// Sprites individuais (usados como "carimbos")
+TFT_eSprite spriteNave = TFT_eSprite(&tft);
+TFT_eSprite spriteAsteroide = TFT_eSprite(&tft);
+TFT_eSprite spriteTiro = TFT_eSprite(&tft);
+
+// Dados do jogo
+Nave nave;
+Asteroide asteroides[MAX_ASTEROIDES];
+Tiro tiros[MAX_TIROS];
+
+int score = 0;
+int vidas = 3;
+int dificuldade = 1;
+unsigned long startTimeJogo = 0;
+unsigned long ultimoSpawnAsteroide = 0;
+unsigned long ultimoTiro = 0;
+unsigned long ultimoFrame = 0;
+
+// ========== SETUP ==========
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  tft.init();
+  tft.setRotation(0);
+  tft.fillScreen(TFT_BLACK);
+
+  // Cria sprites individuais
+  spriteNave.createSprite(NAVE_SIZE, NAVE_SIZE);
+  spriteAsteroide.createSprite(ASTEROIDE_SIZE, ASTEROIDE_SIZE);
+  spriteTiro.createSprite(TIRO_SIZE, TIRO_SIZE);
+
+  // Cria sprite de tela inteira (16 bpp) – sem paleta
+  telaBuffer.createSprite(SCREEN_W, SCREEN_H);
+
+  pinMode(PIN_POT, INPUT);
+
+  // Posição inicial da nave (centro)
+  nave.x = SCREEN_W / 2 - NAVE_SIZE / 2;
+  nave.y = SCREEN_H / 2 - NAVE_SIZE / 2;
+  nave.angulo = 0;
+
+  // Desativa todos os asteroides e tiros
+  for (int i = 0; i < MAX_ASTEROIDES; i++) asteroides[i].ativo = false;
+  for (int i = 0; i < MAX_TIROS; i++) tiros[i].ativo = false;
+
+  startTimeJogo = millis();
+  Serial.println("Jogo iniciado!");
+}
+
+// ========== LOOP PRINCIPAL ==========
+void loop() {
+  unsigned long agora = millis();
+  if (agora - ultimoFrame < FRAME_TIME_MS) return;
+  ultimoFrame = agora;
+
+  if (vidas <= 0) {
+    gameOver();
+    return;
+  }
+
+  lerPotenciometro();
+  calcularDirecaoTiro();
+  dispararTiro();
+  moverTiros();
+  moverAsteroides();
+  gerarAsteroides();
+  atualizarDificuldade();
+  verificarColisoes();
+
+  desenharTudo();
+}
+
+// ========== ENTRADA ==========
+void lerPotenciometro() {
+  int leitura = analogRead(PIN_POT);
+  nave.angulo = map(leitura, 0, 4095, -120, 120);
+}
+
+// ========== ATUALIZAÇÃO ==========
+void calcularDirecaoTiro() {
+  float rad = (nave.angulo + 90) * PI / 180.0;
+  float vel = 5.0;
+  nave.velTiroX = cos(rad) * vel;
+  nave.velTiroY = sin(rad) * vel;
+}
+
+void dispararTiro() {
+  unsigned long agora = millis();
+  if (agora - ultimoTiro < TIRO_COOLDOWN_MS) return;
+  ultimoTiro = agora;
+
+  for (int i = 0; i < MAX_TIROS; i++) {
+    if (!tiros[i].ativo) {
+      tiros[i].x = nave.x + NAVE_SIZE / 2.0;
+      tiros[i].y = nave.y + NAVE_SIZE / 2.0;
+      tiros[i].velX = nave.velTiroX;
+      tiros[i].velY = nave.velTiroY;
+      tiros[i].ativo = true;
+      break;
+    }
+  }
+}
+
+void moverTiros() {
+  for (int i = 0; i < MAX_TIROS; i++) {
+    if (!tiros[i].ativo) continue;
+    tiros[i].x += tiros[i].velX;
+    tiros[i].y += tiros[i].velY;
+    if (tiros[i].x < 0 || tiros[i].x > SCREEN_W ||
+        tiros[i].y < 0 || tiros[i].y > SCREEN_H)
+      tiros[i].ativo = false;
+  }
+}
+
+void moverAsteroides() {
+  for (int i = 0; i < MAX_ASTEROIDES; i++) {
+    if (!asteroides[i].ativo) continue;
+    asteroides[i].x += asteroides[i].velX;
+    asteroides[i].y += asteroides[i].velY;
+    // Wrap-around
+    if (asteroides[i].x < -ASTEROIDE_SIZE) asteroides[i].x = SCREEN_W;
+    if (asteroides[i].x > SCREEN_W) asteroides[i].x = -ASTEROIDE_SIZE;
+    if (asteroides[i].y < -ASTEROIDE_SIZE) asteroides[i].y = SCREEN_H;
+    if (asteroides[i].y > SCREEN_H) asteroides[i].y = -ASTEROIDE_SIZE;
+  }
+}
+
+void gerarAsteroides() {
+  int intervalo = BASE_SPAWN_INTERVAL_MS - (dificuldade * 150);
+  if (intervalo < MIN_SPAWN_INTERVAL_MS) intervalo = MIN_SPAWN_INTERVAL_MS;
+  if (millis() - ultimoSpawnAsteroide < intervalo) return;
+  ultimoSpawnAsteroide = millis();
+
+  for (int i = 0; i < MAX_ASTEROIDES; i++) {
+    if (asteroides[i].ativo) continue;
+    int lado = random(4);
+    switch (lado) {
+      case 0:
+        asteroides[i].x = random(SCREEN_W);
+        asteroides[i].y = -ASTEROIDE_SIZE;
+        break;
+      case 1:
+        asteroides[i].x = SCREEN_W;
+        asteroides[i].y = random(SCREEN_H);
+        break;
+      case 2:
+        asteroides[i].x = random(SCREEN_W);
+        asteroides[i].y = SCREEN_H;
+        break;
+      case 3:
+        asteroides[i].x = -ASTEROIDE_SIZE;
+        asteroides[i].y = random(SCREEN_H);
+        break;
+    }
+    float velBase = 1.5 + (dificuldade * 0.2);
+    asteroides[i].velX = (random(-100, 101) / 50.0) * velBase;
+    asteroides[i].velY = (random(-100, 101) / 50.0) * velBase;
+    if (asteroides[i].velX == 0 && asteroides[i].velY == 0) asteroides[i].velX = 1;
+    asteroides[i].tipo = random(3);
+    asteroides[i].ativo = true;
+    break;
+  }
+}
+
+void atualizarDificuldade() {
+  unsigned long segundos = (millis() - startTimeJogo) / 1000;
+  dificuldade = 1 + (segundos / 30);
+  if (dificuldade > 10) dificuldade = 10;
+}
+
+// ========== COLISÕES ==========
+float distancia(float x1, float y1, float x2, float y2) {
+  float dx = x2 - x1;
+  float dy = y2 - y1;
+  return sqrt(dx*dx + dy*dy);
+}
+
+void verificarColisoes() {
+  // Tiros vs Asteroides
+  for (int i = 0; i < MAX_TIROS; i++) {
+    if (!tiros[i].ativo) continue;
+    for (int j = 0; j < MAX_ASTEROIDES; j++) {
+      if (!asteroides[j].ativo) continue;
+      float cxT = tiros[i].x;
+      float cyT = tiros[i].y;
+      float cxA = asteroides[j].x + ASTEROIDE_SIZE/2.0;
+      float cyA = asteroides[j].y + ASTEROIDE_SIZE/2.0;
+      if (distancia(cxT, cyT, cxA, cyA) < 12) {
+        tiros[i].ativo = false;
+        asteroides[j].ativo = false;
+        score += 100 * dificuldade;
+      }
+    }
+  }
+
+  // Nave vs Asteroides
+  float cxN = nave.x + NAVE_SIZE/2.0;
+  float cyN = nave.y + NAVE_SIZE/2.0;
+  for (int i = 0; i < MAX_ASTEROIDES; i++) {
+    if (!asteroides[i].ativo) continue;
+    float cxA = asteroides[i].x + ASTEROIDE_SIZE/2.0;
+    float cyA = asteroides[i].y + ASTEROIDE_SIZE/2.0;
+    if (distancia(cxN, cyN, cxA, cyA) < 15) {
+      asteroides[i].ativo = false;
+      vidas--;
+    }
+  }
+}
+
+// ========== DESENHO (Double Buffer 16 bpp) ==========
+void desenharTudo() {
+  // Limpa o buffer com preto
+  telaBuffer.fillSprite(TFT_BLACK);
+
+  // Borda branca
+  telaBuffer.drawRect(0, 0, SCREEN_W-1, SCREEN_H-1, TFT_WHITE);
+
+  // Desenha asteroides (cada sprite é copiado por completo, sem transparência)
+  for (int i = 0; i < MAX_ASTEROIDES; i++) {
+    if (!asteroides[i].ativo) continue;
+    // Prepara o sprite do asteroide
+    spriteAsteroide.fillSprite(TFT_BLACK);
+    spriteAsteroide.fillCircle(ASTEROIDE_SIZE/2, ASTEROIDE_SIZE/2, ASTEROIDE_SIZE/2 - 2, TFT_DARKGREY);
+    spriteAsteroide.drawCircle(ASTEROIDE_SIZE/2, ASTEROIDE_SIZE/2, ASTEROIDE_SIZE/2 - 2, TFT_WHITE);
+    spriteAsteroide.fillCircle(ASTEROIDE_SIZE/3, ASTEROIDE_SIZE/3, 2, TFT_BLACK);
+    spriteAsteroide.fillCircle(2*ASTEROIDE_SIZE/3, 2*ASTEROIDE_SIZE/3, 2, TFT_BLACK);
+    // Copia para o buffer (sem parâmetro de transparência)
+    spriteAsteroide.pushToSprite(&telaBuffer, asteroides[i].x, asteroides[i].y);
+  }
+
+  // Desenha tiros
+  for (int i = 0; i < MAX_TIROS; i++) {
+    if (!tiros[i].ativo) continue;
+    spriteTiro.fillSprite(TFT_BLACK);
+    spriteTiro.fillCircle(TIRO_SIZE/2, TIRO_SIZE/2, TIRO_SIZE/2 - 1, TFT_YELLOW);
+    spriteTiro.pushToSprite(&telaBuffer, (int)tiros[i].x - TIRO_SIZE/2, (int)tiros[i].y - TIRO_SIZE/2);
+  }
+
+  // Desenha nave
+  spriteNave.fillSprite(TFT_BLACK);
+  int cx = NAVE_SIZE/2;
+  spriteNave.fillTriangle(cx, 2, 2, NAVE_SIZE-3, NAVE_SIZE-3, cx, TFT_GREEN);
+  spriteNave.fillTriangle(cx, 2, NAVE_SIZE-3, NAVE_SIZE-3, cx, NAVE_SIZE-3, TFT_GREEN);
+  spriteNave.fillCircle(cx, cx-2, 2, TFT_WHITE);
+  spriteNave.pushToSprite(&telaBuffer, nave.x, nave.y);
+
+  // Desenha HUD diretamente no buffer (fundo transparente)
+  telaBuffer.setTextColor(TFT_WHITE, TFT_BLACK);
+  telaBuffer.setTextSize(1);
+  telaBuffer.setCursor(5, 5);
+  telaBuffer.print("SCORE: ");
+  telaBuffer.print(score);
+  telaBuffer.setCursor(SCREEN_W - 70, 5);
+  telaBuffer.print("VIDAS: ");
+  telaBuffer.print(vidas);
+  telaBuffer.setCursor(SCREEN_W/2 - 30, 5);
+  telaBuffer.print("DIFIC: ");
+  telaBuffer.print(dificuldade);
+
+  // Transfere o buffer completo para a tela (em uma única rajada SPI)
+  tft.startWrite();
+  telaBuffer.pushSprite(0, 0);
+  tft.endWrite();
+}
+
+// ========== GAME OVER ==========
+void gameOver() {
+  telaBuffer.fillSprite(TFT_BLACK);
+  telaBuffer.setTextColor(TFT_RED, TFT_BLACK);
+  telaBuffer.setTextSize(3);
+  telaBuffer.setCursor(SCREEN_W/2 - 70, SCREEN_H/2 - 30);
+  telaBuffer.print("GAME OVER");
+  telaBuffer.setTextSize(1);
+  telaBuffer.setTextColor(TFT_WHITE, TFT_BLACK);
+  telaBuffer.setCursor(SCREEN_W/2 - 50, SCREEN_H/2 + 10);
+  telaBuffer.print("FINAL SCORE: ");
+  telaBuffer.print(score);
+  telaBuffer.pushSprite(0, 0);
+
+  delay(5000);
+
+  // Reinicia todas as variáveis
+  vidas = 3;
+  score = 0;
+  dificuldade = 1;
+  startTimeJogo = millis();
+  ultimoSpawnAsteroide = 0;
+  ultimoTiro = 0;
+  for (int i = 0; i < MAX_ASTEROIDES; i++) asteroides[i].ativo = false;
+  for (int i = 0; i < MAX_TIROS; i++) tiros[i].ativo = false;
+  nave.x = SCREEN_W/2 - NAVE_SIZE/2;
+  nave.y = SCREEN_H/2 - NAVE_SIZE/2;
+}
+```
+### User_Setup.h
+```cpp
+// User_Setup.h - Configuração recomendada para ST7789 240x320 + ESP32
+
+// 1) Driver do display
+#define ST7789_DRIVER
+
+// 2) Resolução
+#define TFT_WIDTH  240
+#define TFT_HEIGHT 320
+
+// 3) Pinos SPI (ESP32 padrão)
+#define TFT_MOSI 23
+#define TFT_SCLK 18
+#define TFT_CS   15
+#define TFT_DC    2
+#define TFT_RST   4
+
+// Se o seu display NÃO tem CS, comente o CS acima e desabilite o CS:
+// #define TFT_CS   -1
+
+// 4) Backlight (opcional, se controlado por GPIO)
+// #define TFT_BL   5
+// #define TFT_BACKLIGHT_ON HIGH
+
+// 5) Troca de cores (se as cores estiverem invertidas, descomente)
+// #define TFT_RGB_ORDER TFT_BGR
+
+// 6) Offset de colunas/linhas (ajuste se a imagem estiver cortada/deslocada)
+// Para muitos ST7789 240x320, colStart/rowStart = 0;
+// Se precisar, experimente:
+// #define CGRAM_OFFSET
+// #define COLSTART 0
+// #define ROWSTART 0
+
+// 7) SPI mais rápido para jogos
+#define SPI_FREQUENCY  40000000
+#define SPI_READ_FREQUENCY  20000000
+
+// 8) Fontes
+#define LOAD_GLCD   // Fonte 8x8
+#define LOAD_FONT2  // Fonte 4x6
+#define LOAD_FONT4  // Fonte 6x8
+#define LOAD_FONT6  // Fonte 8x12
+#define LOAD_FONT7  // Fonte 7x14
+#define LOAD_FONT8  // Fonte 8x16
+#define LOAD_GFXFF  // FreeFonts (GFX)
+
+// 9) Sprites (para aumentar performance e evitar flicker)
+#define HEAP_CAPSULE_AVAILABLE
+
+// 10) Desabilitar MISO (se não usar leitura do display)
+#define TFT_MISO -1
+```
+### sprites_data.h
+```cpp
+// Dados dos sprites convertidos de PNG → RGB565 (TFT_eSPI)
+
+// Spaceship.png
+const unsigned short nave_sprite[] = {
+  0x0000, 0x0000, 0x0000, 0x0000, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 
+  0x0000, 0x0000, 0x0000, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 
+  0x0000, 0x0000, 0xFFFF, 0xFFFF, 0x0000, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 
+  0x0000, 0xFFFF, 0xFFFF, 0x0000, 0x0000, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0x0000, 0xFFFF, 0x0000, 0x0000, 0x0000, 0x0000, 
+  0x0000, 0xFFFF, 0xFFFF, 0x0000, 0x0000, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0x0000, 0xFFFF, 0xFFFF, 0x0000, 0x0000, 0x0000, 
+  0xFFFF, 0xFFFF, 0x0000, 0x0000, 0x0000, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0x0000, 0xFFFF, 0xFFFF, 0xFFFF, 0x0000, 0x0000, 
+  0xFFFF, 0xFFFF, 0x0000, 0x0000, 0x0000, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0x0000, 0xFFFF, 0xFFFF, 0xFFFF, 0x0000, 0x0000, 
+  0x0000, 0xFFFF, 0xFFFF, 0x0000, 0x0000, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0x0000, 0xFFFF, 0xFFFF, 0x0000, 0x0000, 0x0000, 
+  0x0000, 0xFFFF, 0xFFFF, 0x0000, 0x0000, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0x0000, 0xFFFF, 0x0000, 0x0000, 0x0000, 0x0000, 
+  0x0000, 0x0000, 0xFFFF, 0xFFFF, 0x0000, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 
+  0x0000, 0x0000, 0x0000, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 
+  0x0000, 0x0000, 0x0000, 0x0000, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 
+  0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 
+  0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 
+  0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 
+  0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 
+};
+
+// Asteroid_mars.png
+const unsigned short asteroide1_sprite[] = {
+  0x0000, 0x0000, 0x0000, 0x0000, 0x8841, 0x9061, 0x9061, 0x9061, 0x8841, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 
+  0x0000, 0x0000, 0x0000, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x8841, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 
+  0x0000, 0x0000, 0x8841, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x8841, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 
+  0x0000, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x8841, 0x0000, 0x0000, 0x0000, 0x0000, 
+  0x8841, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x8841, 0x0000, 0x0000, 0x0000, 
+  0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x0000, 0x0000, 0x0000, 
+  0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x8841, 0x0000, 0x0000, 
+  0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x0000, 0x0000, 
+  0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x0000, 0x0000, 
+  0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x8841, 0x0000, 0x0000, 
+  0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x0000, 0x0000, 0x0000, 
+  0x8841, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x8841, 0x0000, 0x0000, 0x0000, 
+  0x0000, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x8841, 0x0000, 0x0000, 0x0000, 0x0000, 
+  0x0000, 0x0000, 0x8841, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x8841, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 
+  0x0000, 0x0000, 0x0000, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x9061, 0x8841, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 
+  0x0000, 0x0000, 0x0000, 0x0000, 0x8841, 0x9061, 0x9061, 0x9061, 0x8841, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 
+};
+
+// Space_trash.png  
+const unsigned short asteroide2_sprite[] = {
+  0x0000, 0x0000, 0x0000, 0x0000, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 
+  0x0000, 0x0000, 0x0000, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 
+  0x0000, 0x0000, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x0000, 0x0000, 0x0000, 0x0000, 
+  0x0000, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x0000, 0x0000, 0x0000, 
+  0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x0000, 0x0000, 
+  0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x0000, 
+  0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x0000, 
+  0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x0000, 
+  0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x0000, 
+  0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x0000, 0x0000, 
+  0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x0000, 0x0000, 
+  0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x0000, 0x0000, 0x0000, 
+  0x0000, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x0000, 0x0000, 0x0000, 
+  0x0000, 0x0000, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x0000, 0x0000, 0x0000, 0x0000, 
+  0x0000, 0x0000, 0x0000, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 
+  0x0000, 0x0000, 0x0000, 0x0000, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x4A69, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 
+};
+
+// The_Alien.png
+const unsigned short asteroide3_sprite[] = {
+  0x0000, 0x0000, 0x0000, 0x0000, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 
+  0x0000, 0x0000, 0x0000, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 
+  0x0000, 0x0000, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0x0000, 0x0000, 0x0000, 0x0000, 
+  0x0000, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0x0000, 0x0000, 0x0000, 
+  0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0x0000, 0x0000, 
+  0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0x0000, 
+  0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0x0000, 
+  0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0x0000, 
+  0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0x0000, 
+  0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0x0000, 0x0000, 
+  0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0x0000, 0x0000, 
+  0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0x0000, 0x0000, 0x0000, 
+  0x0000, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0x0000, 0x0000, 0x0000, 
+  0x0000, 0x0000, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0x0000, 0x0000, 0x0000, 0x0000, 
+  0x0000, 0x0000, 0x0000, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 
+  0x0000, 0x0000, 0x0000, 0x0000, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 
+};
+```
